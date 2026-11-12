@@ -1,0 +1,156 @@
+name: Build APK from any zip
+
+# One-time setup: keep this file at .github/workflows/build-any-zip.yml
+# Then upload ANY Android project zip (Gradle project, Java or Kotlin) anywhere in the repo.
+# The zip from the latest upload is built, the APK comes as an artifact named after the zip.
+# Manual run: Actions > this workflow > Run workflow > (optional) type the zip path to rebuild an older zip.
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: "Zip path to build (empty = zip of the latest upload)"
+        required: false
+        default: ""
+
+concurrency:
+  group: build-any-zip-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Pick the zip and unpack it into a clean folder
+        id: prep
+        shell: bash
+        run: |
+          set -e
+          zip="${{ github.event.inputs.zip }}"
+          if [ -z "$zip" ]; then
+            # zips that the latest commit added or changed (a normal "Add files via upload")
+            zip=$(git diff-tree --no-commit-id --name-only --diff-filter=AMR -r --root HEAD 2>/dev/null | grep -i '\.zip$' | tail -1 || true)
+          fi
+          if [ -n "$zip" ] && [ ! -f "$zip" ]; then zip=""; fi
+          if [ -z "$zip" ]; then
+            # otherwise the zip with the newest commit
+            best=-1
+            while IFS= read -r f; do
+              [ -f "$f" ] || continue
+              t=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+              [ -z "$t" ] && t=0
+              if [ "$t" -ge "$best" ]; then zip="$f"; best="$t"; fi
+            done < <(git ls-files '*.zip')
+          fi
+          if [ -z "$zip" ] || [ ! -f "$zip" ]; then
+            echo "::error::No zip found in the repo. Upload your project zip (the zip must contain settings.gradle and app/)."
+            exit 1
+          fi
+          echo "Using zip: $zip"
+          stem=$(basename "$zip" .zip | sed 's/[^A-Za-z0-9._-]/_/g')
+          echo "stem=$stem" >> "$GITHUB_OUTPUT"
+          rm -rf /tmp/proj /tmp/build && mkdir -p /tmp/proj /tmp/build
+          unzip -o -q "$zip" -d /tmp/proj
+          sg=$(find /tmp/proj \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/__MACOSX/*' | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+          if [ -z "$sg" ]; then
+            echo "::error::settings.gradle / settings.gradle.kts not found inside $zip. This is not a Gradle Android project zip."
+            exit 1
+          fi
+          cp -a "$(dirname "$sg")"/. /tmp/build/
+          cd /tmp/build
+          label=$(grep -rho 'android:label="[^"]*"' --include=AndroidManifest.xml . | head -1 || true)
+          appid=$(grep -rhoE "applicationId[ =]+['\"][^'\"]+['\"]" --include=build.gradle --include=build.gradle.kts . | head -1 || true)
+          { echo "### Building \`$zip\`"; echo "- $label"; echo "- $appid"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "$label  $appid"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install the SDK platform the project needs
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd /tmp/build
+          sdk=$(grep -rhoE "compileSdk(Version)?[ =(]+[0-9]+" --include=build.gradle --include=build.gradle.kts . | grep -oE "[0-9]+$" | sort -n | tail -1 || true)
+          if [ -z "$sdk" ]; then sdk=34; fi
+          echo "compileSdk $sdk"
+          sdkmanager "platforms;android-$sdk" || true
+
+      - name: Pick and install Gradle
+        shell: bash
+        run: |
+          cd /tmp/build
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew
+            echo "G=./gradlew" >> "$GITHUB_ENV"
+            echo "Using the project's own gradle wrapper"
+            exit 0
+          fi
+          ver=""
+          if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+            ver=$(grep -oE 'gradle-[0-9]+\.[0-9]+(\.[0-9]+)?' gradle/wrapper/gradle-wrapper.properties | head -1 | sed 's/gradle-//' || true)
+          fi
+          if [ -z "$ver" ]; then
+            agp=$(grep -rhoE "com\.android\.tools\.build:gradle:[0-9]+\.[0-9]+" --include=build.gradle --include=build.gradle.kts . | head -1 | grep -oE "[0-9]+\.[0-9]+$" || true)
+            if [ -z "$agp" ]; then agp=$(grep -rhoE "com\.android\.application[\"')]* +version +[\"'][0-9]+\.[0-9]+" --include=build.gradle --include=build.gradle.kts . | head -1 | grep -oE "[0-9]+\.[0-9]+$" || true); fi
+            if [ -z "$agp" ]; then agp=$(grep -rhoE '^agp *= *"[0-9]+\.[0-9]+' --include=libs.versions.toml . | head -1 | grep -oE "[0-9]+\.[0-9]+$" || true); fi
+            echo "Android Gradle plugin: ${agp:-unknown}"
+            case "$agp" in
+              7.0) ver=7.0.2 ;; 7.1) ver=7.2 ;; 7.2) ver=7.3.3 ;; 7.3) ver=7.4 ;; 7.4) ver=7.5 ;;
+              8.0|8.1) ver=8.0 ;; 8.2) ver=8.2 ;; 8.3) ver=8.4 ;; 8.4) ver=8.6 ;; 8.5|8.6) ver=8.7 ;;
+              8.7) ver=8.9 ;; 8.8) ver=8.10.2 ;; 8.9|8.10) ver=8.11.1 ;; 8.11|8.12|8.13) ver=8.13 ;;
+              *) ver=8.4 ;;
+            esac
+          fi
+          echo "Installing Gradle $ver"
+          curl -fsSL --retry 5 --retry-delay 3 -o /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-$ver-bin.zip"
+          mkdir -p "$HOME/gradle"
+          unzip -q /tmp/gradle.zip -d "$HOME/gradle"
+          echo "$HOME/gradle/gradle-$ver/bin" >> "$GITHUB_PATH"
+          echo "G=gradle" >> "$GITHUB_ENV"
+
+      - name: Build debug APK
+        working-directory: /tmp/build
+        run: $G assembleDebug --no-daemon --stacktrace
+
+      - name: Build release APK (smaller and faster, optional)
+        working-directory: /tmp/build
+        continue-on-error: true
+        run: $G assembleRelease --no-daemon
+
+      - name: Collect APKs
+        if: always()
+        env:
+          STEM: ${{ steps.prep.outputs.stem }}
+        shell: bash
+        run: |
+          mkdir -p dist
+          while IFS= read -r f; do
+            cp "$f" "dist/${STEM}-$(basename "$f")"
+          done < <(find /tmp/build -path '*/build/outputs/apk/*' -name '*.apk' 2>/dev/null)
+          ls -la dist
+          { echo "### APK files"; ls -1 dist | sed 's/^/- /'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prep.outputs.stem }}-APK-run${{ github.run_number }}
+          path: dist/*.apk
+          if-no-files-found: warn
